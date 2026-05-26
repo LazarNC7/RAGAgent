@@ -7,24 +7,65 @@ using Microsoft.SemanticKernel.Connectors.InMemory;
 using OpenAI;
 using OpenAI.Chat;
 
+//    nomic-embed-text        dims=768   ctx=8192  
+//    mxbai-embed-large       dims=1024  ctx=512   
+//    snowflake-arctic-embed2 dims=1024  ctx=8192  
 
-var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN")
-    ?? throw new InvalidOperationException(
-        "Set GITHUB_TOKEN to a GitHub personal access token with the 'models' scope.");
 
-var chatModelId      = Environment.GetEnvironmentVariable("GITHUB_MODEL")      ?? "openai/gpt-4o-mini";
-var embeddingModelId = Environment.GetEnvironmentVariable("GITHUB_EMBED_MODEL") ?? "openai/text-embedding-3-small";
+var ollamaEndpoint   = Environment.GetEnvironmentVariable("OLLAMA_ENDPOINT")    ?? "http://localhost:11434";
+var chatModelId      = Environment.GetEnvironmentVariable("OLLAMA_CHAT_MODEL")  ?? "llama3.2";
+var embeddingModelId = Environment.GetEnvironmentVariable("OLLAMA_EMBED_MODEL") ?? "snowflake-arctic-embed2";
+
+var embeddingDims = embeddingModelId switch
+{
+    "nomic-embed-text"        => 768,
+    "mxbai-embed-large"       => 1024,
+    "snowflake-arctic-embed2" => 1024,
+    _ => throw new InvalidOperationException(
+        $"Unknown embedding model '{embeddingModelId}'. " +
+        "Add its dimension to the switch or set a known model.")
+};
+
+var chunkSize = embeddingModelId == "mxbai-embed-large" ? 400 : 1500;
+var overlap   = embeddingModelId == "mxbai-embed-large" ? 80  : 200;
+
+Console.WriteLine($"Embedding model : {embeddingModelId}  (dims={embeddingDims}, chunkSize={chunkSize})");
+Console.WriteLine($"Chat model      : {chatModelId}");
+Console.WriteLine($"Ollama endpoint : {ollamaEndpoint}");
+Console.WriteLine();
+
 
 var openAIClient = new OpenAIClient(
-    new ApiKeyCredential(token),
-    new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai/inference") });
+    new ApiKeyCredential("ollama"),               
+    new OpenAIClientOptions
+    {
+        Endpoint = new Uri($"{ollamaEndpoint.TrimEnd('/')}/v1")
+    });
 
 
 var embeddingClient  = openAIClient.GetEmbeddingClient(embeddingModelId);
-var embeddingOptions = new OpenAI.Embeddings.EmbeddingGenerationOptions { Dimensions = 1536 };
+
+OpenAI.Embeddings.EmbeddingGenerationOptions? embeddingOptions = null;
 
 var vectorStore = new InMemoryVectorStore();
-var collection = vectorStore.GetCollection<Guid, Chunk>("company-docs");
+var collection  = vectorStore.GetCollection<Guid, Chunk>(
+    "company-docs",
+    new VectorStoreCollectionDefinition
+    {
+        Properties =
+        [
+            new VectorStoreKeyProperty(nameof(Chunk.Id), typeof(Guid)),
+            new VectorStoreDataProperty(nameof(Chunk.Text),     typeof(string)),
+            new VectorStoreDataProperty(nameof(Chunk.Source),   typeof(string)),
+            new VectorStoreDataProperty(nameof(Chunk.Category), typeof(string)) { IsIndexed = true },
+            new VectorStoreVectorProperty(nameof(Chunk.Vector), embeddingDims)
+            {
+                Type             = typeof(ReadOnlyMemory<float>),
+                DistanceFunction = DistanceFunction.CosineSimilarity,
+            },
+        ]
+    });
+
 await collection.EnsureCollectionExistsAsync();
 
 var docsPath = Path.Combine(AppContext.BaseDirectory, "Docs");
@@ -35,7 +76,7 @@ foreach (var file in Directory.GetFiles(docsPath, "*.md"))
 {
     var text     = await File.ReadAllTextAsync(file);
     var category = InferCategory(Path.GetFileName(file));
-    var chunks   = Chunker.Split(text, chunkSize: 1500, overlap: 200);
+    var chunks   = Chunker.Split(text, chunkSize, overlap);
     var count    = 0;
 
     foreach (var chunk in chunks)
@@ -58,7 +99,7 @@ foreach (var file in Directory.GetFiles(docsPath, "*.md"))
 Console.WriteLine($"\nReady — chunks indexed.\n");
 
 
-var kb = new KnowledgeBase(collection, embeddingClient, embeddingOptions);
+var kb = new KnowledgeBase(collection, embeddingClient);
 
 var agent = openAIClient
     .GetChatClient(chatModelId)
@@ -120,7 +161,6 @@ class Chunk
     [VectorStoreData(IsIndexed = true)]
     public string Category { get; set; } = "";
 
-    [VectorStoreVector(1536, DistanceFunction = DistanceFunction.CosineSimilarity)]
     public ReadOnlyMemory<float> Vector { get; set; }
 }
 
@@ -141,8 +181,7 @@ static class Chunker
 
 class KnowledgeBase(
     VectorStoreCollection<Guid, Chunk> collection,
-    OpenAI.Embeddings.EmbeddingClient embeddingClient,
-    OpenAI.Embeddings.EmbeddingGenerationOptions embeddingOptions)
+    OpenAI.Embeddings.EmbeddingClient embeddingClient)
 {
     [Description(
         "Search the company knowledge base for information about HR policies, IT support, " +
@@ -153,7 +192,7 @@ class KnowledgeBase(
         [Description("Optional category filter: HR, IT, Finance, Product. Leave empty to search all.")] string? category = null,
         [Description("Number of results to return. Default is 3.")] int topK = 3)
     {
-        var result      = await embeddingClient.GenerateEmbeddingAsync(query, embeddingOptions);
+        var result      = await embeddingClient.GenerateEmbeddingAsync(query);
         var queryVector = new ReadOnlyMemory<float>(result.Value.ToFloats().ToArray());
 
         var options = new VectorSearchOptions<Chunk>
